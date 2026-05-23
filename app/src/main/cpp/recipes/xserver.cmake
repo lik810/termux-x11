@@ -281,7 +281,14 @@ add_library(Xlorie SHARED
         "lorie/InputXKB.c"
         "lorie/renderer.c"
         "lorie/buffer.c"
-        "lorie/activity.c")
+        "lorie/activity.c"
+        "termux_hybrid_platform.cpp"
+        )
+set_target_properties(Xlorie PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
 target_include_directories(Xlorie PRIVATE ${inc} "libxcvt/include")
 target_link_options(Xlorie PRIVATE "-Wl,--as-needed" "-Wl,--no-undefined" "-fvisibility=hidden")
 target_link_libraries(Xlorie "-Wl,--whole-archive" ${XSERVER_LIBS} "-Wl,--no-whole-archive" android mediandk log m z EGL GLESv2)
