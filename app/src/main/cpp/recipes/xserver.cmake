@@ -282,6 +282,7 @@ add_library(Xlorie SHARED
         "lorie/renderer.c"
         "lorie/buffer.c"
         "lorie/activity.c"
+        "lorie/lorie_jni_glue.c"
         "termux_hybrid_platform.cpp"
         )
 set_target_properties(Xlorie PROPERTIES
