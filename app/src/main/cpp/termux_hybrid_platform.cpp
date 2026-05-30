@@ -15,6 +15,14 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+// ===== 新增 Wayland 协议头 =====
+#include <wayland-server.h>
+#include <wayland-server-protocol.h>
+#include "xdg-shell-server-protocol.h"
+// ==============================
 
 // ============================================================================
 // 1. 统一底层数据结构定义
@@ -88,6 +96,18 @@ typedef struct android_platform {
     // 内部私有 Android 上下文
     void* android_context;
 } android_platform_t;
+
+// ========== Wayland 合成器内部状态 ==========
+typedef struct {
+    bool is_active;
+    struct wl_display* display;
+    struct wl_event_loop* event_loop;
+    struct wl_global* compositor_global;
+    struct wl_global* shm_global;
+    struct wl_global* seat_global;
+} wayland_compositor_t;
+
+static wayland_compositor_t g_wayland_server = {false, NULL, NULL, NULL, NULL, NULL};
 
 // 全局唯一的 Android 平台抽象实例
 static android_platform_t* g_platform = NULL;
@@ -178,6 +198,48 @@ void* init_android_platform(void* native_window) {
     g_platform = platform;
     return (void*)platform;
 }
+
+//  新增 Wayland 合成器启动与事件循环 
+bool start_wayland_compositor(const char* socket_dir) {
+    if (g_wayland_server.is_active) return true;
+
+        // 1. 创建 Wayland Display 实例
+    g_wayland_server.display = wl_display_create();
+    if (!g_wayland_server.display) {
+        return false;
+    }
+
+        // 2. 获取事件循环
+    g_wayland_server.event_loop = wl_display_get_event_loop(g_wayland_server.display);
+
+    // 3. 初始化最小协议集 (wl_shm)
+    wl_display_init_shm(g_wayland_server.display);
+
+        // 4. 创建 socket 文件
+    char socket_path[512];
+    snprintf(socket_path, sizeof(socket_path), "%s/wayland-0", socket_dir);
+    unlink(socket_path);
+
+     if (wl_display_add_socket(g_wayland_server.display, "wayland-0") < 0) {
+     wl_display_destroy(g_wayland_server.display);
+     return false;
+    }
+
+        // 5. 接置环境变量，客户端可自动连接
+    setenv("WAYLAND_DISPLAY", "wayland-0", 1);
+
+    g_wayland_server.is_active = true;
+    return true;
+}
+
+void update_wayland_compositor_events() {
+    if (!g_wayland_server.is_active) return;
+
+    // 阻塞处理事件，并刷新客户端
+    wl_event_loop_dispatch(g_wayland_server.event_loop, 0);
+    wl_display_flush_clients(g_wayland_server.display);
+}
+// -----------------------------------------
 
 // ============================================================================
 // 5. 统一的输入与平台管理中心 (双协议事件路由转发)
