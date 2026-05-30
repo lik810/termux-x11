@@ -26,6 +26,7 @@ extern "C" {
     void* init_android_platform(void* native_window);
     void global_platform_inject_key(int32_t keycode, int32_t action);
     void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_t button_mask);
+    int start_wayland_compositor(const char* socket_dir);
 #ifdef __cplusplus
 }
 #endif
@@ -62,8 +63,15 @@ Java_com_termux_x11_LorieView_setSurface(JNIEnv* env, jobject thiz, jobject surf
     } else {
         LOGI("android_platform_t initialization completed successfully.");
     }
-}
 
+      //  启动应用内嵌 Wayland 合成器 
+      const char* app_files_dir = "/data/data/com.termux/files";
+      if (!start_wayland_compositor(app_files_dir)) {
+            LOGE("Failed to start Wayland compositor!");
+      } else {
+                LOGI("Wayland compositor started successfully.");
+      }
+}
 // ----------------------------------------------------------------------------
 // JNI 接口实现：接管并分发 Android 端的原始硬件输入事件
 // ----------------------------------------------------------------------------
