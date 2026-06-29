@@ -29,7 +29,7 @@
 
 static int argc = 0;
 static char** argv = NULL;
-__LIBC_HIDDEN__ volatile int conn_fd = -1; // The only variable shared with activity code.
+__LIBC_HIDDEN__ volatile int conn_fd = -1;
 extern DeviceIntPtr lorieMouse, lorieTouch, lorieKeyboard, loriePen, lorieEraser;
 extern ScreenPtr pScreenPtr;
 extern int ucs2keysym(long ucs);
@@ -73,15 +73,14 @@ JNIEXPORT jboolean JNICALL
 Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjectArray args) {
     pthread_t t;
     JavaVM* vm = NULL;
-    // execv's argv array is a bit incompatible with Java's String[], so we do some converting here...
-    argc = (*env)->GetArrayLength(env, args) + 1; // Leading executable path
+    argc = (*env)->GetArrayLength(env, args) + 1;
     argv = (char**) calloc(argc, sizeof(char*));
 
     argv[0] = (char*) "Xlorie";
     for(int i=1; i<argc; i++) {
         jstring js = (jstring)((*env)->GetObjectArrayElement(env, args, i - 1));
         const char *pjc = (*env)->GetStringUTFChars(env, js, JNI_FALSE);
-        argv[i] = (char *) calloc(strlen(pjc) + 1, sizeof(char)); //Extra char for the terminating NULL
+        argv[i] = (char *) calloc(strlen(pjc) + 1, sizeof(char));
         strcpy((char *) argv[i], pjc);
         (*env)->ReleaseStringUTFChars(env, js, pjc);
     }
@@ -98,21 +97,16 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
     }
 
     if (getenv("TERMUX_X11_DEBUG") && !fork()) {
-        // Printing logs of local logcat.
         char pid[32] = {0};
         prctl(PR_SET_PDEATHSIG, SIGTERM);
         sprintf(pid, "%d", getppid());
         execlp("logcat", "logcat", "--pid", pid, NULL);
     }
 
-    // No matter what tracer is attached.
-    // In the case of gdb or lldb LD_PRELOAD is already set.
-    // In the case of proot or proot-distro libtermux-exec in LD_PRELOAD will break linking.
     if (access("/data/data/com.termux/files/usr/lib/libtermux-exec.so", F_OK) == 0 && !detectTracer()
             && !getenv("XSTARTUP_LD_PRELOAD"))
         setenv("LD_PRELOAD", "/data/data/com.termux/files/usr/lib/libtermux-exec.so", 1);
 
-    // adb sets TMPDIR to /data/local/tmp which is pretty useless.
     if (!strcmp("/data/local/tmp", getenv("TMPDIR") ?: ""))
         unsetenv("TMPDIR");
 
@@ -162,7 +156,6 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
     }
 
     if (!getenv("XKB_CONFIG_ROOT")) {
-        // chroot case
         const char *root_dir = dirname(getenv("TMPDIR"));
         char current_path[1024] = {0};
         snprintf(current_path, sizeof(current_path), "%s/usr/share/X11/xkb", root_dir);
@@ -171,12 +164,10 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
     }
 
     if (!getenv("XKB_CONFIG_ROOT")) {
-        // proot case
         if (access("/usr/share/xkeyboard-config-2", F_OK) == 0)
             setenv("XKB_CONFIG_ROOT", "/usr/share/xkeyboard-config-2", 1);
         else if (access("/usr/share/X11/xkb", F_OK) == 0)
             setenv("XKB_CONFIG_ROOT", "/usr/share/X11/xkb", 1);
-        // Termux case
         else if (access("/data/data/com.termux/files/usr/share/xkeyboard-config-2", F_OK) == 0)
             setenv("XKB_CONFIG_ROOT", "/data/data/com.termux/files/usr/share/xkeyboard-config-2", 1);
         else if (access("/data/data/com.termux/files/usr/share/X11/xkb", F_OK) == 0)
@@ -200,7 +191,6 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
     (*env)->GetJavaVM(env, &vm);
 
     AChoreographer *choreographer = AChoreographer_getInstance();
-    // Trigger it first time
     AChoreographer_postFrameCallback(choreographer, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, choreographer);
 
     xorg_list_init(&registeredBuffers);
@@ -209,7 +199,6 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
 }
 
 static Bool sendConfigureNotify(__unused ClientPtr pClient, void *closure) {
-    // This must be done only on X server thread.
     lorieEvent* e = closure;
     __android_log_print(ANDROID_LOG_ERROR, "tx11-request", "window changed: %d %d %s", e->screenSize.width, e->screenSize.height, e->screenSize.name);
     lorieConfigureNotify(e->screenSize.width, e->screenSize.height, e->screenSize.framerate, e->screenSize.name_size, e->screenSize.name);
@@ -218,13 +207,11 @@ static Bool sendConfigureNotify(__unused ClientPtr pClient, void *closure) {
 }
 
 static Bool handleClipboardAnnounce(__unused ClientPtr pClient, __unused void *closure) {
-    // This must be done only on X server thread.
     lorieHandleClipboardAnnounce();
     return TRUE;
 }
 
 static Bool handleClipboardData(__unused ClientPtr pClient, void *closure) {
-    // This must be done only on X server thread.
     lorieHandleClipboardData(closure);
     return TRUE;
 }
@@ -237,7 +224,6 @@ static Bool handleTouchEvent(__unused ClientPtr pClient, void *closure) {
     valuator_mask_zero(&mask);
     DDXTouchPointInfoPtr touch = TouchFindByDDXID(lorieTouch, e->touch.id, FALSE);
 
-    // Avoid duplicating events
     if (touch && touch->active) {
         double oldx = 0, oldy = 0;
         if (e->touch.type == XI_TouchUpdate &&
@@ -247,7 +233,6 @@ static Bool handleTouchEvent(__unused ClientPtr pClient, void *closure) {
             goto end;
     }
 
-    // Sometimes activity part does not send XI_TouchBegin and sends only XI_TouchUpdate.
     if (e->touch.type == XI_TouchUpdate && (!touch || !touch->active))
         e->touch.type = XI_TouchBegin;
 
@@ -347,7 +332,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
             case EVENT_MOUSE: {
                 int flags;
                 switch(e.mouse.detail) {
-                    case 0: // BUTTON_UNDEFINED
+                    case 0:
                         flags = (e.mouse.relative) ? POINTER_RELATIVE | POINTER_ACCELERATE : POINTER_ABSOLUTE | POINTER_SCREEN | POINTER_NORAW;
                         if (!e.mouse.relative) {
                             e.mouse.x = max(0, min(e.mouse.x, pScreenPtr->width));
@@ -357,12 +342,12 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                         valuator_mask_set_double(&mask, 1, (double) e.mouse.y);
                         QueuePointerEvents(lorieMouse, MotionNotify, 0, flags, &mask);
                         break;
-                    case 1: // BUTTON_LEFT
-                    case 2: // BUTTON_MIDDLE
-                    case 3: // BUTTON_RIGHT
+                    case 1:
+                    case 2:
+                    case 3:
                         QueuePointerEvents(lorieMouse, e.mouse.down ? ButtonPress : ButtonRelease, e.mouse.detail, POINTER_RELATIVE, NULL);
                         break;
-                    case 4: // BUTTON_SCROLL
+                    case 4:
                         if (e.mouse.x) {
                             valuator_mask_zero(&mask);
                             valuator_mask_set_double(&mask, 2, (double) e.mouse.x / 120);
@@ -429,7 +414,6 @@ bool lorieConnectionAlive(void) {
     if (conn_fd == -1)
         return false;
 
-    // Check if socket is closed or has errors.
     struct pollfd p = { .fd = conn_fd, .events = POLLIN | POLLHUP | POLLERR | POLLRDHUP };
     return !(poll(&p, 1, 0) == 1 && (p.revents & (POLLERR | POLLNVAL | POLLRDHUP | POLLHUP)));
 }
@@ -452,7 +436,7 @@ void lorieSendSharedServerState(int memfd) {
 void lorieRegisterBuffer(LorieBuffer* buffer) {
     unsigned long id = LorieBuffer_description(buffer)->id;
     if (conn_fd == -1 || LorieBufferList_findById(&registeredBuffers, id))
-        return; // Already registered
+        return;
 
     if (conn_fd != -1 && buffer) {
         lorieEvent e = { .type = EVENT_ADD_BUFFER };
@@ -467,7 +451,7 @@ void lorieRegisterBuffer(LorieBuffer* buffer) {
 void lorieUnregisterBuffer(LorieBuffer* buffer) {
     unsigned long id;
     if (!buffer || (!LorieBufferList_findById(&registeredBuffers, (id = LorieBuffer_description(buffer)->id))))
-        return;  // Not exist or not registered so no need to unregister
+        return;
 
     if (conn_fd != -1 && buffer) {
         lorieEvent e = { .removeBuffer = { .t = EVENT_REMOVE_BUFFER, .id = id } };
@@ -533,9 +517,6 @@ Java_com_termux_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz
     jmethodID sendBroadcast = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "sendBroadcast", "()V");
     uint8_t buffer[512] = {0};
 
-    // Even in the case if it will fail for some reason everything will work fine
-    // But connection will be delayed a bit
-
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         log(ERROR, "Socket creation failed: %s", strerror(errno));
         return;
@@ -576,26 +557,34 @@ Java_com_termux_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz
 // CLI 可执行文件入口：在 X11 主循环前启动 Inline Wayland 服务端
 // ----------------------------------------------------------------------------
 
+#include <stdio.h>
+#include <stdbool.h>
+
 extern bool start_wayland_compositor(const char* socket_dir);
 extern int xorg_main(int argc, char *argv[], char *envp[]);
 
 int main(int argc, char *argv[], char *envp[]) {
-    log(INFO, "Termux-X11 CLI executable launched! Preparing Dual-Protocol Environment...");
+    fprintf(stdout, "\n==================================================\n");
+    fprintf(stdout, "[DEBUG] Termux-X11 CLI Main Entrance Triggered!\n");
+    fprintf(stdout, "==================================================\n");
+    fflush(stdout);
 
-    const char* socket_path = "/data/data/com.termux/files";
-
-    struct stat st = {0};
-    if (stat(socket_path, &st) == -1) {
-        mkdir(socket_path, 0700);
+    const char* socket_path = getenv("TMPDIR");
+    if (!socket_path) {
+        socket_path = "/data/data/com.termux/files/usr/tmp";
     }
+
+    fprintf(stdout, "[DEBUG] Attempting to host Wayland socket at: %s\n", socket_path);
+    fflush(stdout);
 
     if (start_wayland_compositor(socket_path)) {
-        log(INFO, "Inline Wayland engine successfully pre-initialized via CLI process!");
+        fprintf(stdout, "[DEBUG] start_wayland_compositor returned TRUE!\n");
     } else {
-        log(ERROR, "Failed to pre-initialize Inline Wayland engine.");
+        fprintf(stderr, "[ERROR] start_wayland_compositor returned FALSE!\n");
     }
+    fflush(stdout);
+    fflush(stderr);
 
-    log(INFO, "Handing over control to Xorg Main Loop.");
     return xorg_main(argc, argv, envp);
 }
 
