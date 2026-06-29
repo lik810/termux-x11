@@ -1,6 +1,6 @@
 /**
  * @file lorie_jni_glue.c
- * @brief Android JNI 双协议统一剪贴板、输入法与 DPI 同步胶合层
+ * @brief Android JNI 双协议统一剪贴板、输入法与 DPI 同步胶合层 (对齐 scale 动态接口)
  */
 
 #include <jni.h>
@@ -26,8 +26,9 @@ extern "C" {
     void global_platform_inject_key(int32_t keycode, int32_t action);
     void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_t button_mask);
 
+    void platform_set_output_scale(void* self, float scale_x, float scale_y);
+
     void* g_platform_instance_ptr = NULL;
-    void platform_set_output_scale(void* platform_ptr, float scale_x, float scale_y);
 #ifdef __cplusplus
 }
 #endif

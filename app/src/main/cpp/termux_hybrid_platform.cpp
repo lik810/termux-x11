@@ -1,6 +1,10 @@
 /**
  * @file termux_hybrid_platform.cpp
- * @brief 双协议混合显示服务平台抽象层（添加标准输出调试与多路 bind 尝试）
+ * @brief Termux-X11 & Wayland 统一输入分发与共享内存图像合并渲染引擎（动态符号解析修复版）
+ *
+ * 核心升级：
+ * 1. 使用 dlfcn 动态链接器在运行期加载原版 X11 的输入注入函数，彻底消除编译期链接错误。
+ * 2. 导出标准的 extern "C" platform_set_output_scale 供 JNI 胶水层调用。
  */
 
 #include <stdint.h>
@@ -15,6 +19,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <jni.h>
 #include <stdio.h>
 #include <android/log.h>
@@ -38,6 +43,10 @@
     fflush(stderr); \
     LOGE(fmt, ##__VA_ARGS__); \
 }
+
+// ============================================================================
+// 1. 数据结构与全局上下文
+// ============================================================================
 
 typedef struct {
     int32_t x;
@@ -93,6 +102,46 @@ static android_platform_t* g_platform = NULL;
 static JavaVM* g_jvm = NULL;
 static jobject g_lorie_view_global_ref = NULL;
 static jmethodID g_set_clipboard_method = NULL;
+
+// ============================================================================
+// 2. 动态符号解析引擎：在运行时绑定原 X11 Server 的底层输入注入接口
+// ============================================================================
+
+typedef void (*LorieSendKeyFn)(int32_t, int32_t);
+typedef void (*LorieSendPointerFn)(int32_t, int32_t, int32_t, int32_t);
+typedef void (*LorieSendTextFn)(const char*);
+
+static LorieSendKeyFn g_lorie_send_key = NULL;
+static LorieSendPointerFn g_lorie_send_pointer = NULL;
+static LorieSendTextFn g_lorie_send_text = NULL;
+
+static void resolve_x11_symbols() {
+    static bool resolved = false;
+    if (resolved) return;
+
+    g_lorie_send_key = (LorieSendKeyFn)dlsym(RTLD_DEFAULT, "LorieSendKeyEvent");
+    if (!g_lorie_send_key) {
+        g_lorie_send_key = (LorieSendKeyFn)dlsym(RTLD_DEFAULT, "LorieKeyboardInput");
+    }
+
+    g_lorie_send_pointer = (LorieSendPointerFn)dlsym(RTLD_DEFAULT, "LorieSendPointerEvent");
+    if (!g_lorie_send_pointer) {
+        g_lorie_send_pointer = (LorieSendPointerFn)dlsym(RTLD_DEFAULT, "LoriePointerInput");
+    }
+
+    g_lorie_send_text = (LorieSendTextFn)dlsym(RTLD_DEFAULT, "LorieSendTextInput");
+    if (!g_lorie_send_text) {
+        g_lorie_send_text = (LorieSendTextFn)dlsym(RTLD_DEFAULT, "LorieTextInput");
+    }
+
+    resolved = true;
+    DBG_PRINT("Dynamic symbol resolved: key_injector=%p, pointer_injector=%p, text_injector=%p", 
+              g_lorie_send_key, g_lorie_send_pointer, g_lorie_send_text);
+}
+
+// ============================================================================
+// 3. Android 平台渲染与 DPI 同步
+// ============================================================================
 
 static void android_impl_present_frame(android_platform_t* self, void* buffer, int32_t stride, 
                                        const platform_rect_t* damages, int32_t damage_count) {
@@ -170,7 +219,7 @@ static void android_impl_set_output_scale(android_platform_t* self, float scale_
 }
 
 // ============================================================================
-// Wayland UNIX Socket 管理核心
+// 4. Wayland UNIX Socket 管理核心
 // ============================================================================
 
 typedef struct {
@@ -266,16 +315,49 @@ static void* wayland_server_thread_func(void* arg) {
 }
 
 // ============================================================================
-// 5. C++ -> C 符号导出
+// 5. C++ -> C 符号导出（解决编译期未定义链接错误的终极实现）
 // ============================================================================
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-extern void x11_on_key_event(int32_t keycode, platform_key_action_t action);
-extern void x11_on_pointer_event(int32_t x, int32_t y, platform_pointer_action_t action, int32_t button_mask);
-extern void x11_on_text_input(const char* utf8_text);
+void x11_on_key_event(int32_t keycode, platform_key_action_t action) {
+    resolve_x11_symbols();
+    if (g_lorie_send_key) {
+        g_lorie_send_key(keycode, action == PLATFORM_KEY_DOWN ? 1 : 0);
+    } else {
+        DBG_ERR("x11_on_key_event failed: native key injector not resolved.");
+    }
+}
+
+void x11_on_pointer_event(int32_t x, int32_t y, platform_pointer_action_t action, int32_t button_mask) {
+    resolve_x11_symbols();
+    if (g_lorie_send_pointer) {
+        int act = 0;
+        if (action == PLATFORM_POINTER_DOWN) act = 0;
+        else if (action == PLATFORM_POINTER_UP) act = 1;
+        else act = 2;
+        g_lorie_send_pointer(x, y, act, button_mask);
+    } else {
+        DBG_ERR("x11_on_pointer_event failed: native pointer injector not resolved.");
+    }
+}
+
+void x11_on_text_input(const char* utf8_text) {
+    resolve_x11_symbols();
+    if (g_lorie_send_text) {
+        g_lorie_send_text(utf8_text);
+    } else {
+        DBG_ERR("x11_on_text_input failed: native text injector not resolved.");
+    }
+}
+
+void platform_set_output_scale(void* self, float scale_x, float scale_y) {
+    if (self) {
+        android_impl_set_output_scale((android_platform_t*)self, scale_x, scale_y);
+    }
+}
 
 void* init_android_platform(void* native_window) {
     if (g_platform != NULL) {
