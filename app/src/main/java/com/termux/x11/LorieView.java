@@ -343,6 +343,7 @@ public class LorieView extends SurfaceView implements InputStub {
     private long lastClipboardTimestamp = System.currentTimeMillis();
     private static boolean clipboardSyncEnabled = false;
     private static boolean hardwareKbdScancodesWorkaround = false;
+    private boolean mDisableClipboardListener = false;
     private final InputMethodManager mIMM = (InputMethodManager)getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
     private Callback mCallback;
     private final Point p = new Point();
@@ -523,8 +524,11 @@ public class LorieView extends SurfaceView implements InputStub {
             else
                 resetCursorPosition = true;
             if (mBatchEditNesting == 0)
-                // beginBatchEdit was not called so it will not be reported otherwise
                 sendCursorPosition();
+
+            if (text != null && text.length() > 0) {
+                sendTextInput(text.toString());
+            }
 
             return replaceText(text, false);
         }
@@ -740,6 +744,25 @@ public class LorieView extends SurfaceView implements InputStub {
         return super.dispatchKeyEvent(event);
     }
 
+    private final ClipboardManager.OnPrimaryClipChangedListener mHybridClipListener = new ClipboardManager.OnPrimaryClipChangedListener() {
+        @Override
+        public void onPrimaryClipChanged() {
+            if (mDisableClipboardListener) return;
+            try {
+                ClipData clip = clipboard.getPrimaryClip();
+                if (clip != null && clip.getItemCount() > 0) {
+                    CharSequence text = clip.getItemAt(0).getText();
+                    if (text != null) {
+                        onClipboardChanged(text.toString());
+                        Log.i("LorieView_Java", "Native clipboard synchronized from OS: " + text);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("LorieView_Java", "Error reading clip change: " + e.getMessage());
+            }
+        }
+    };
+
     ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::handleClipboardChange;
 
     public void reloadPreferences(Prefs p) {
@@ -755,10 +778,37 @@ public class LorieView extends SurfaceView implements InputStub {
     void setClipboardText(String text) {
         clipboard.setPrimaryClip(ClipData.newPlainText("X11 clipboard", text));
 
-        // Android does not send PrimaryClipChanged event to the window which posted event
-        // But in the case we are owning focus and clipboard is unchanged it will be replaced by the same value on X server side.
-        // Not cool in the case if user installed some clipboard manager, clipboard content will be doubled.
         lastClipboardTimestamp = System.currentTimeMillis() + 150;
+    }
+
+    public void setAndroidClipboard(final String text) {
+        if (text == null) return;
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ClipboardManager cb = (ClipboardManager)
+                            getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cb != null) {
+                        ClipData clip = ClipData.newPlainText("TermuxHybridClipboard", text);
+                        mDisableClipboardListener = true;
+                        cb.setPrimaryClip(clip);
+                        mDisableClipboardListener = false;
+                        Log.i("LorieView_Java", "System clipboard updated from Native: " + text);
+                    }
+                } catch (Exception e) {
+                    Log.e("LorieView_Java", "Failed to set Android clipboard: " + e.getMessage());
+                }
+            }
+        });
+    }
+
+    @Override
+    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        super.onSizeChanged(w, h, oldw, oldh);
+        float density = getResources().getDisplayMetrics().density;
+        onDpiScaleChanged(density, density);
+        Log.i("LorieView_Java", "DPI metrics report: density=" + density);
     }
 
     /** @noinspection unused*/ // It is used in native code
@@ -801,9 +851,12 @@ public class LorieView extends SurfaceView implements InputStub {
 
         if (clipboardSyncEnabled && hasFocus) {
             clipboard.addPrimaryClipChangedListener(clipboardListener);
+            clipboard.addPrimaryClipChangedListener(mHybridClipListener);
             checkForClipboardChange();
-        } else
+        } else {
             clipboard.removePrimaryClipChangedListener(clipboardListener);
+            clipboard.removePrimaryClipChangedListener(mHybridClipListener);
+        }
 
         TouchInputHandler.refreshInputDevices();
     }
@@ -848,6 +901,9 @@ public class LorieView extends SurfaceView implements InputStub {
     @FastNative static native void setClipboardSyncEnabled(boolean enabled, boolean ignored);
     @FastNative public native void sendClipboardAnnounce();
     @FastNative public native void sendClipboardEvent(byte[] text);
+    @FastNative public native void onClipboardChanged(String text);
+    @FastNative public native void sendTextInput(String text);
+    @FastNative public native void onDpiScaleChanged(float scaleX, float scaleY);
     @FastNative static native void sendWindowChange(int width, int height, int framerate, String name);
     @FastNative static native void setViewport(int x, int y, int width, int height, int expectedWidth, int expectedHeight);
     @FastNative public native void sendMouseEvent(float x, float y, int whichButton, boolean buttonDown, boolean relative);
