@@ -572,6 +572,33 @@ Java_com_termux_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz
     }
 }
 
+// ----------------------------------------------------------------------------
+// CLI 可执行文件入口：在 X11 主循环前启动 Inline Wayland 服务端
+// ----------------------------------------------------------------------------
+
+extern bool start_wayland_compositor(const char* socket_dir);
+extern int xorg_main(int argc, char *argv[], char *envp[]);
+
+int main(int argc, char *argv[], char *envp[]) {
+    log(INFO, "Termux-X11 CLI executable launched! Preparing Dual-Protocol Environment...");
+
+    const char* socket_path = "/data/data/com.termux/files";
+
+    struct stat st = {0};
+    if (stat(socket_path, &st) == -1) {
+        mkdir(socket_path, 0700);
+    }
+
+    if (start_wayland_compositor(socket_path)) {
+        log(INFO, "Inline Wayland engine successfully pre-initialized via CLI process!");
+    } else {
+        log(ERROR, "Failed to pre-initialize Inline Wayland engine.");
+    }
+
+    log(INFO, "Handing over control to Xorg Main Loop.");
+    return xorg_main(argc, argv, envp);
+}
+
 void abort(void) {
     _exit(134);
 }
