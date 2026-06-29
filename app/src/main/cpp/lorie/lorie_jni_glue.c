@@ -12,6 +12,7 @@
 #include <android/log.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #define LOG_TAG "Lorie_JNIGlue"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -24,9 +25,9 @@
 extern "C" {
 #endif
     void* init_android_platform(void* native_window);
+    bool start_wayland_compositor(const char* socket_dir);
     void global_platform_inject_key(int32_t keycode, int32_t action);
     void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_t button_mask);
-    int start_wayland_compositor(const char* socket_dir);
 #ifdef __cplusplus
 }
 #endif

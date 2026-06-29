@@ -15,14 +15,11 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-
-// ===== 新增 Wayland 协议头 =====
-#include <wayland-server.h>
-#include <wayland-server-protocol.h>
-#include "xdg-shell-server-protocol.h"
-// ==============================
+#include <fcntl.h>
+#include <android/log.h>
 
 // ============================================================================
 // 1. 统一底层数据结构定义
@@ -97,17 +94,15 @@ typedef struct android_platform {
     void* android_context;
 } android_platform_t;
 
-// ========== Wayland 合成器内部状态 ==========
+// ========== Wayland 零外部依赖内嵌服务端状态 ==========
 typedef struct {
-    bool is_active;
-    struct wl_display* display;
-    struct wl_event_loop* event_loop;
-    struct wl_global* compositor_global;
-    struct wl_global* shm_global;
-    struct wl_global* seat_global;
-} wayland_compositor_t;
+    pthread_t thread;
+    bool is_running;
+    int server_fd;
+    int client_fd;
+} inline_wayland_server_t;
 
-static wayland_compositor_t g_wayland_server = {false, NULL, NULL, NULL, NULL, NULL};
+static inline_wayland_server_t g_wl_server = {0, false, -1, -1};
 
 // 全局唯一的 Android 平台抽象实例
 static android_platform_t* g_platform = NULL;
@@ -199,46 +194,121 @@ void* init_android_platform(void* native_window) {
     return (void*)platform;
 }
 
-//  新增 Wayland 合成器启动与事件循环 
 bool start_wayland_compositor(const char* socket_dir) {
-    if (g_wayland_server.is_active) return true;
+    if (g_wl_server.is_running) return true;
 
-        // 1. 创建 Wayland Display 实例
-    g_wayland_server.display = wl_display_create();
-    if (!g_wayland_server.display) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOGE("Failed to create UNIX socket");
         return false;
     }
 
-        // 2. 获取事件循环
-    g_wayland_server.event_loop = wl_display_get_event_loop(g_wayland_server.display);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/wayland-0", socket_dir);
+    unlink(addr.sun_path);
 
-    // 3. 初始化最小协议集 (wl_shm)
-    wl_display_init_shm(g_wayland_server.display);
-
-        // 4. 创建 socket 文件
-    char socket_path[512];
-    snprintf(socket_path, sizeof(socket_path), "%s/wayland-0", socket_dir);
-    unlink(socket_path);
-
-     if (wl_display_add_socket(g_wayland_server.display, "wayland-0") < 0) {
-     wl_display_destroy(g_wayland_server.display);
-     return false;
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOGE("Failed to bind UNIX socket to path: %s", addr.sun_path);
+        close(fd);
+        return false;
     }
 
-        // 5. 接置环境变量，客户端可自动连接
-    setenv("WAYLAND_DISPLAY", "wayland-0", 1);
+    if (listen(fd, 5) < 0) {
+        LOGE("Failed to listen on socket");
+        close(fd);
+        return false;
+    }
 
-    g_wayland_server.is_active = true;
+    g_wl_server.server_fd = fd;
+    g_wl_server.is_running = true;
+    setenv("WAYLAND_DISPLAY", "wayland-0", 1);
+    LOGI("Wayland server listening on socket: %s", addr.sun_path);
+
+    if (pthread_create(&g_wl_server.thread, NULL, wayland_server_thread_func, NULL) != 0) {
+        LOGE("Failed to create wayland server dispatcher thread");
+        g_wl_server.is_running = false;
+        close(fd);
+        return false;
+    }
+
     return true;
 }
 
-void update_wayland_compositor_events() {
-    if (!g_wayland_server.is_active) return;
+// ============================================================================
+// 4. 自主研发：Wayland 极简二进制 Wire 协议通信引擎 (零外部依赖)
+// ============================================================================
 
-    // 阻塞处理事件，并刷新客户端
-    wl_event_loop_dispatch(g_wayland_server.event_loop, 0);
-    wl_display_flush_clients(g_wayland_server.display);
+static void send_wayland_event(int client_fd, uint32_t object_id, uint16_t opcode,
+                               const void* data, uint16_t data_size) {
+    uint32_t header[2];
+    header[0] = object_id;
+    uint32_t total_size = 8 + data_size;
+    total_size = (total_size + 3) & ~3;
+    header[1] = (total_size << 16) | opcode;
+
+    send(client_fd, header, 8, 0);
+    if (data_size > 0 && data != NULL) {
+        send(client_fd, data, data_size, 0);
+        uint32_t pad = 0;
+        int padding_bytes = total_size - (8 + data_size);
+        if (padding_bytes > 0) {
+            send(client_fd, &pad, padding_bytes, 0);
+        }
+    }
 }
+
+static void* wayland_server_thread_func(void* arg) {
+    LOGI("Wayland inline server thread started");
+
+    while (g_wl_server.is_running) {
+        struct sockaddr_un client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        int client_fd = accept(g_wl_server.server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (g_wl_server.is_running) {
+                usleep(100000);
+            }
+            continue;
+        }
+
+        LOGI("Wayland client connected! Handshaking...");
+        g_wl_server.client_fd = client_fd;
+        fcntl(client_fd, F_SETFL, O_NONBLOCK);
+
+        struct {
+            uint32_t id;
+            uint32_t str_len;
+            char name[16];
+            uint32_t version;
+        } __attribute__((packed)) global_compositor_event = {
+            1, 13, "wl_compositor", 4
+        };
+        send_wayland_event(client_fd, 2, 0, &global_compositor_event, sizeof(global_compositor_event));
+
+        uint32_t buffer[1024];
+        while (g_wl_server.is_running && g_wl_server.client_fd != -1) {
+            ssize_t bytes = recv(client_fd, buffer, sizeof(buffer), 0);
+            if (bytes > 0) {
+                uint32_t object_id = buffer[0];
+                uint32_t size_opcode = buffer[1];
+                uint16_t size = size_opcode >> 16;
+                uint16_t opcode = size_opcode & 0xFFFF;
+                LOGI("Wayland Received: Object %u, Opcode %u, Size %u", object_id, opcode, size);
+            } else if (bytes == 0 || (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                LOGI("Wayland client disconnected.");
+                close(client_fd);
+                g_wl_server.client_fd = -1;
+                break;
+            }
+            usleep(16000);
+        }
+    }
+    return NULL;
+}
+
 // -----------------------------------------
 
 // ============================================================================
