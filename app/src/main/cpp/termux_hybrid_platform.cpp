@@ -21,6 +21,16 @@
 #include <fcntl.h>
 #include <android/log.h>
 
+#ifndef TAG
+#define TAG "HybridPlatform"
+#endif
+#ifndef LOGI
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#endif
+#ifndef LOGE
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#endif
+
 // ============================================================================
 // 1. 统一底层数据结构定义
 // ============================================================================
@@ -161,6 +171,9 @@ static void android_impl_set_output_scale(android_platform_t* self, float scale_
 // ============================================================================
 // 4. C++ -> C 符号导出（解决 Undefined Symbol 链接报错的核心部分）
 // ============================================================================
+
+// wayland_server_thread_func 前向声明（供 start_wayland_compositor 中的 pthread_create 使用）
+static void* wayland_server_thread_func(void* arg);
 
 #ifdef __cplusplus
 extern "C" {
