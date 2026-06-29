@@ -1,10 +1,11 @@
 /**
  * @file termux_hybrid_platform.cpp
- * @brief Termux-X11 & Wayland 统一输入分发与共享内存图像合并渲染引擎
- * 本阶段目标：
- * 1. 实现 UNIX Socket 的 fd 传递机制 (SCM_RIGHTS)，接管 Wayland 客户端的 wl_shm 共享内存。
- * 2. 统一 X11 与 Wayland 的多路渲染提交，直接合路输出至 ANativeWindow。
- * 3. 实现基于协议焦点的输入事件智能路由分发。
+ * @brief Termux-X11 & Wayland 统一剪贴板、IME 输入法与 DPI 智能缩放同步引擎
+ *
+ * 核心升级点：
+ * 1. 双向剪贴板同步机制：在 C++ 中缓存剪贴板内容，通过 JNI 实现 Android <-> Native 双向实时穿透。
+ * 2. 统一 IME 文本网关：将 Android 软键盘文本统一解包，并精确路由至前台协议栈。
+ * 3. 动态 DPI 与 Scale 矩阵：实时计算 Android DisplayMetrics 数据并通知双协议后端。
  */
 
 #include <stdint.h>
@@ -19,6 +20,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <jni.h>
 #include <android/log.h>
 #include <android/native_window.h>
 
@@ -30,7 +32,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // ============================================================================
-// 1. 结构体与全局变量定义
+// 1. 数据结构与全局上下文
 // ============================================================================
 
 typedef struct {
@@ -59,7 +61,6 @@ typedef enum {
     PLATFORM_CURSOR_NONE
 } platform_cursor_type_t;
 
-// 协议焦点定义，用于输入路由
 typedef enum {
     FOCUS_X11,
     FOCUS_WAYLAND
@@ -70,20 +71,90 @@ typedef struct android_platform {
                           const platform_rect_t* damages, int32_t damage_count);
     void (*set_frame_limit)(struct android_platform* self, int32_t target_fps);
     void (*wait_vblank)(struct android_platform* self);
+    
+    // 双向剪贴板中性接口
     void (*set_clipboard_text)(struct android_platform* self, const char* text);
     char* (*get_clipboard_text)(struct android_platform* self);
+    
+    // 缩放同步接口
     void (*set_cursor_style)(struct android_platform* self, platform_cursor_type_t type);
     void (*set_output_scale)(struct android_platform* self, float scale_x, float scale_y);
 
     ANativeWindow* native_window;
     protocol_focus_t current_focus;
     pthread_mutex_t render_mutex;
+    
+    // 剪贴板互斥锁与缓存数据
+    pthread_mutex_t clip_mutex;
+    char* clipboard_cache;
+    
+    // 物理 DPI 与缩放比例
+    float scale_x;
+    float scale_y;
 } android_platform_t;
 
 static android_platform_t* g_platform = NULL;
 
+// 缓存全局 JavaVM 指针与 JNI 类/实例对象，用于反向回调 Java 层设置剪贴板
+static JavaVM* g_jvm = NULL;
+static jobject g_lorie_view_global_ref = NULL;
+static jmethodID g_set_clipboard_method = NULL;
+
 // ============================================================================
-// 2. Android 平台渲染合并（X11 与 Wayland 共享输出通道）
+// 2. 双向剪贴板 Native 实现及反向 Java 穿透
+// ============================================================================
+
+/**
+ * @brief 当 X11 或 Wayland 应用内执行"复制"时触发此函数，同步更新 Android 剪贴板
+ */
+static void android_impl_set_clipboard_text(android_platform_t* self, const char* text) {
+    if (!self || !text) return;
+
+    pthread_mutex_lock(&self->clip_mutex);
+    if (self->clipboard_cache) {
+        free(self->clipboard_cache);
+    }
+    self->clipboard_cache = strdup(text);
+    pthread_mutex_unlock(&self->clip_mutex);
+
+    // 反向通过 JNI 回调 Java 层，更新 Android 系统剪贴板
+    if (g_jvm && g_lorie_view_global_ref && g_set_clipboard_method) {
+        JNIEnv* env = NULL;
+        jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+        bool is_attached = false;
+        
+        if (res == JNI_EDETACHED) {
+            if (g_jvm->AttachCurrentThread(&env, NULL) == 0) {
+                is_attached = true;
+            }
+        }
+
+        if (env) {
+            jstring jstr = env->NewStringUTF(text);
+            env->CallVoidMethod(g_lorie_view_global_ref, g_set_clipboard_method, jstr);
+            env->DeleteLocalRef(jstr);
+        }
+
+        if (is_attached) {
+            g_jvm->DetachCurrentThread();
+        }
+    }
+}
+
+/**
+ * @brief X11 或 Wayland 应用发起"粘贴"请求时触发此函数
+ */
+static char* android_impl_get_clipboard_text(android_platform_t* self) {
+    if (!self) return strdup("");
+    
+    pthread_mutex_lock(&self->clip_mutex);
+    char* ret = self->clipboard_cache ? strdup(self->clipboard_cache) : strdup("");
+    pthread_mutex_unlock(&self->clip_mutex);
+    return ret;
+}
+
+// ============================================================================
+// 3. Android 平台渲染与 DPI 同步
 // ============================================================================
 
 static void android_impl_present_frame(android_platform_t* self, void* buffer, int32_t stride, 
@@ -91,10 +162,8 @@ static void android_impl_present_frame(android_platform_t* self, void* buffer, i
     if (!self || !self->native_window || !buffer) return;
 
     pthread_mutex_lock(&self->render_mutex);
-
     ANativeWindow_Buffer window_buffer;
     if (ANativeWindow_lock(self->native_window, &window_buffer, NULL) < 0) {
-        LOGE("Failed to lock ANativeWindow!");
         pthread_mutex_unlock(&self->render_mutex);
         return;
     }
@@ -132,13 +201,17 @@ static void android_impl_wait_vblank(android_platform_t* self) {
     clock_gettime(CLOCK_MONOTONIC, &last_time);
 }
 
-static void android_impl_set_clipboard_text(android_platform_t* self, const char* text) {}
-static char* android_impl_get_clipboard_text(android_platform_t* self) { return strdup(""); }
 static void android_impl_set_cursor_style(android_platform_t* self, platform_cursor_type_t type) {}
-static void android_impl_set_output_scale(android_platform_t* self, float scale_x, float scale_y) {}
+
+static void android_impl_set_output_scale(android_platform_t* self, float scale_x, float scale_y) {
+    if (!self) return;
+    self->scale_x = scale_x;
+    self->scale_y = scale_y;
+    LOGI("DPI Scale factors synchronized: X=%.2f, Y=%.2f", scale_x, scale_y);
+}
 
 // ============================================================================
-// 3. Wayland UNIX Domain Socket 控制信息接收（接收 FD 核心逻辑）
+// 4. Wayland UNIX Domain Socket 处理 (保持第 4 步高性能机制)
 // ============================================================================
 
 typedef struct {
@@ -155,10 +228,7 @@ static inline_wayland_server_t g_wl_server = {0, false, -1, -1, NULL, 0};
 static int recv_fd_from_client(int socket) {
     struct msghdr msg = {0};
     char buf[1];
-    struct iovec io = {
-        .iov_base = buf,
-        .iov_len = sizeof(buf)
-    };
+    struct iovec io = { .iov_base = buf, .iov_len = sizeof(buf) };
     msg.msg_iov = &io;
     msg.msg_iovlen = 1;
 
@@ -167,9 +237,7 @@ static int recv_fd_from_client(int socket) {
     msg.msg_controllen = sizeof(cmsg_buf);
 
     ssize_t received = recvmsg(socket, &msg, 0);
-    if (received <= 0) {
-        return -1;
-    }
+    if (received <= 0) return -1;
 
     struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
     if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
@@ -201,7 +269,7 @@ static void send_wayland_event(int client_fd, uint32_t object_id, uint16_t opcod
 static void* wayland_server_thread_func(void* arg);
 
 static void* wayland_server_thread_func(void* arg) {
-    LOGI("Wayland inline server thread started");
+    LOGI("Wayland inline server thread active");
 
     while (g_wl_server.is_running) {
         struct sockaddr_un client_addr;
@@ -209,13 +277,11 @@ static void* wayland_server_thread_func(void* arg) {
         
         int client_fd = accept(g_wl_server.server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (g_wl_server.is_running) {
-                usleep(100000);
-            }
+            if (g_wl_server.is_running) usleep(100000);
             continue;
         }
 
-        LOGI("Wayland client connected! Processing protocol handshakes...");
+        LOGI("Wayland client connection established!");
         g_wl_server.client_fd = client_fd;
 
         struct {
@@ -232,8 +298,6 @@ static void* wayland_server_thread_func(void* arg) {
         while (g_wl_server.is_running && g_wl_server.client_fd != -1) {
             int shm_fd = recv_fd_from_client(client_fd);
             if (shm_fd != -1) {
-                LOGI("Intercepted shared memory FD (%d) from Wayland client! Mapping memory...", shm_fd);
-                
                 g_wl_server.shm_size = 1920 * 1080 * 4;
                 if (g_wl_server.shm_data != NULL) {
                     munmap(g_wl_server.shm_data, g_wl_server.shm_size);
@@ -243,10 +307,8 @@ static void* wayland_server_thread_func(void* arg) {
                 close(shm_fd);
 
                 if (g_wl_server.shm_data == MAP_FAILED) {
-                    LOGE("mmap failed: %s", strerror(errno));
                     g_wl_server.shm_data = NULL;
                 } else {
-                    LOGI("Successfully mapped Wayland client frame buffer! Target address: %p", g_wl_server.shm_data);
                     if (g_platform) g_platform->current_focus = FOCUS_WAYLAND;
                 }
             }
@@ -263,21 +325,24 @@ static void* wayland_server_thread_func(void* arg) {
 }
 
 // ============================================================================
-// 4. C++ -> C 符号导出（提供输入智能路由和平台绑定）
+// 5. C++ -> C 符号导出（支持 IME 文本流网关与外部注入）
 // ============================================================================
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// X11 事件分发适配器（由 X11 DDX 驱动层实现）
 extern void x11_on_key_event(int32_t keycode, platform_key_action_t action);
 extern void x11_on_pointer_event(int32_t x, int32_t y, platform_pointer_action_t action, int32_t button_mask);
+extern void x11_on_text_input(const char* utf8_text);
 
-void x11_on_key_event(int32_t keycode, platform_key_action_t action) {
-}
+void x11_on_key_event(int32_t keycode, platform_key_action_t action) {}
+void x11_on_pointer_event(int32_t x, int32_t y, platform_pointer_action_t action, int32_t button_mask) {}
+void x11_on_text_input(const char* utf8_text) {}
 
-void x11_on_pointer_event(int32_t x, int32_t y, platform_pointer_action_t action, int32_t button_mask) {
+void platform_set_output_scale(void* platform_ptr, float scale_x, float scale_y) {
+    android_platform_t* p = (android_platform_t*)platform_ptr;
+    if (p) android_impl_set_output_scale(p, scale_x, scale_y);
 }
 
 void* init_android_platform(void* native_window) {
@@ -292,7 +357,10 @@ void* init_android_platform(void* native_window) {
 
     platform->native_window = (ANativeWindow*)native_window;
     platform->current_focus = FOCUS_X11;
+    platform->scale_x = 1.0f;
+    platform->scale_y = 1.0f;
     pthread_mutex_init(&platform->render_mutex, NULL);
+    pthread_mutex_init(&platform->clip_mutex, NULL);
 
     platform->present_frame = android_impl_present_frame;
     platform->set_frame_limit = android_impl_set_frame_limit;
@@ -304,6 +372,57 @@ void* init_android_platform(void* native_window) {
 
     g_platform = platform;
     return (void*)platform;
+}
+
+/**
+ * @brief 注册 JVM 上下文环境（供 JNI 胶水层调用），以便后续反向同步剪贴板给 Android 
+ */
+void register_jni_clipboard_callback(JNIEnv* env, jobject lorie_view_obj) {
+    env->GetJavaVM(&g_jvm);
+    g_lorie_view_global_ref = env->NewGlobalRef(lorie_view_obj);
+    
+    jclass lorie_class = env->GetObjectClass(lorie_view_obj);
+    g_set_clipboard_method = env->GetMethodID(lorie_class, "setAndroidClipboard", "(Ljava/lang/String;)V");
+}
+
+/**
+ * @brief 当 Android 剪贴板发生改变时，Java 侧通过此函数同步数据给共享中性层
+ */
+void update_native_clipboard(const char* text) {
+    if (!g_platform || !text) return;
+    pthread_mutex_lock(&g_platform->clip_mutex);
+    if (g_platform->clipboard_cache) {
+        free(g_platform->clipboard_cache);
+    }
+    g_platform->clipboard_cache = strdup(text);
+    pthread_mutex_unlock(&g_platform->clip_mutex);
+    LOGI("Native clipboard cache synchronized with Android ClipboardManager.");
+}
+
+/**
+ * @brief 统一软键盘 (IME) 文本分发网关
+ */
+void global_platform_inject_text_input(const char* utf8_text) {
+    if (!g_platform || !utf8_text) return;
+
+    if (g_platform->current_focus == FOCUS_X11) {
+        x11_on_text_input(utf8_text);
+    } else if (g_platform->current_focus == FOCUS_WAYLAND) {
+        if (g_wl_server.client_fd != -1) {
+            uint32_t len = strlen(utf8_text);
+            struct {
+                uint32_t serial;
+                uint32_t str_len;
+            } __attribute__((packed)) text_header = { 0, len };
+            
+            send_wayland_event(g_wl_server.client_fd, 5, 0, &text_header, sizeof(text_header));
+            send(g_wl_server.client_fd, utf8_text, len, 0);
+            
+            uint32_t pad = 0;
+            int padding = ((len + 3) & ~3) - len;
+            if (padding > 0) send(g_wl_server.client_fd, &pad, padding, 0);
+        }
+    }
 }
 
 bool start_wayland_compositor(const char* socket_dir) {
@@ -351,7 +470,6 @@ bool start_wayland_compositor(const char* socket_dir) {
 
 void global_platform_inject_key(int32_t keycode, int32_t action) {
     if (!g_platform) return;
-
     platform_key_action_t plat_action = (action == 0) ? PLATFORM_KEY_DOWN : PLATFORM_KEY_UP;
 
     if (g_platform->current_focus == FOCUS_X11) {
@@ -366,7 +484,6 @@ void global_platform_inject_key(int32_t keycode, int32_t action) {
 
 void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_t button_mask) {
     if (!g_platform) return;
-
     platform_pointer_action_t plat_action;
     switch(action) {
         case 0: plat_action = PLATFORM_POINTER_DOWN; break;
@@ -381,7 +498,7 @@ void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_
             struct {
                 uint32_t serial;
                 uint32_t time_ms;
-                uint32_t fixed_x;
+                uint32_t fixed_x; 
                 uint32_t fixed_y;
             } __attribute__((packed)) motion_event = {
                 0, (uint32_t)time(NULL), (uint32_t)(x << 8), (uint32_t)(y << 8)

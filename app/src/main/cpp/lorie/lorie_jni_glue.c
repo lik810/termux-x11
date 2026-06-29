@@ -1,11 +1,8 @@
 /**
  * @file lorie_jni_glue.c
-   * @brief Android JNI 统一胶水与事件路由层 (实现第 1、2 步)
- *
- * 职责：
- * 1. 挂载所有来自 Android Java ）。 JNI 桥接并触 Surface 发中性平入台层注入）。
- * 2. 桥接并触发中性平台层 (termux_hybrid_platform.cpp) 的全局初始化。
-   */
+ * @brief Android JNI 双协议统一剪贴板、输入法与 DPI 同步胶合层
+ */
+
 #include <jni.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
@@ -18,79 +15,87 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// ----------------------------------------------------------------------------
-// 声明在 termux_hybrid_platform.cpp 中实现的 C++ 原生方法
-// ----------------------------------------------------------------------------
 #ifdef __cplusplus
 extern "C" {
 #endif
     void* init_android_platform(void* native_window);
     bool start_wayland_compositor(const char* socket_dir);
+    void register_jni_clipboard_callback(JNIEnv* env, jobject lorie_view_obj);
+    void update_native_clipboard(const char* text);
+    void global_platform_inject_text_input(const char* utf8_text);
     void global_platform_inject_key(int32_t keycode, int32_t action);
     void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_t button_mask);
+
+    void* g_platform_instance_ptr = NULL;
+    void platform_set_output_scale(void* platform_ptr, float scale_x, float scale_y);
 #ifdef __cplusplus
 }
 #endif
 
-// ----------------------------------------------------------------------------
-// JNI 始口实现：处理 Android Activity / View 的 Surface 绑定
-// ----------------------------------------------------------------------------
-
-/**
- * @brief 当 Android 端的 SurfaceView/TextureView 准备就绪时触发
-   * Java 对应类可能为 com.termux.x11.LorieView 或 LorieActivity
- */
 JNIEXPORT void JNICALL
 Java_com_termux_x11_LorieView_setSurface(JNIEnv* env, jobject thiz, jobject surface) {
-      if (surface == NULL) {
-        LOGI("Surface is NULL, releasing native platform reference");
-        // 可以在此处添加释放平台窗口的逻辑
+    if (surface == NULL) {
+        LOGI("Surface is NULL, releasing resources.");
         return;
-      }
+    }
 
-    // 1. 在取 Android 原始 Surface 对应的 ANativeWindow 句柄
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     if (window == NULL) {
-        LOGE("Failed to get ANativeWindow from Java Surface!");
+        LOGE("Failed to acquire ANativeWindow!");
         return;
     }
 
-    LOGI("Successfully acquired ANativeWindow. Initializing hybrid platform...");
+    LOGI("Acquired ANativeWindow. Launching unified backend platforms...");
 
-    // 2. 调用 C++ 层的中性接口初始化，托管底层渲染和调度管道
-    void* platform_ptr = init_android_platform((void*)window);
-    if (platform_ptr == NULL) {
-        LOGE("Failed to initialize android_platform_t!");
-    } else {
-        LOGI("android_platform_t initialization completed successfully.");
+    g_platform_instance_ptr = init_android_platform((void*)window);
+    if (g_platform_instance_ptr == NULL) {
+        LOGE("Platform initialization failed.");
+        return;
     }
 
-      //  启动应用内嵌 Wayland 合成器 
-      const char* app_files_dir = "/data/data/com.termux/files";
-      if (!start_wayland_compositor(app_files_dir)) {
-            LOGE("Failed to start Wayland compositor!");
-      } else {
-                LOGI("Wayland compositor started successfully.");
-      }
-}
-// ----------------------------------------------------------------------------
-// JNI 接口实现：接管并分发 Android 端的原始硬件输入事件
-// ----------------------------------------------------------------------------
+    register_jni_clipboard_callback(env, thiz);
 
-/**
- * @brief 接收并路由键盘事件
- */
+    const char* socket_path = "/data/data/com.termux/files";
+    if (start_wayland_compositor(socket_path)) {
+        LOGI("Embedded Wayland Engine successfully started!");
+    } else {
+        LOGE("Failed to start Embedded Wayland Engine.");
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_termux_x11_LorieView_onClipboardChanged(JNIEnv* env, jobject thiz, jstring text) {
+    if (text == NULL) return;
+    const char* utf_text = (*env)->GetStringUTFChars(env, text, NULL);
+    if (utf_text) {
+        update_native_clipboard(utf_text);
+        (*env)->ReleaseStringUTFChars(env, text, utf_text);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_termux_x11_LorieView_sendTextInput(JNIEnv* env, jobject thiz, jstring text) {
+    if (text == NULL) return;
+    const char* utf_text = (*env)->GetStringUTFChars(env, text, NULL);
+    if (utf_text) {
+        global_platform_inject_text_input(utf_text);
+        (*env)->ReleaseStringUTFChars(env, text, utf_text);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_termux_x11_LorieView_onDpiScaleChanged(JNIEnv* env, jobject thiz, jfloat scale_x, jfloat scale_y) {
+    if (g_platform_instance_ptr) {
+        platform_set_output_scale(g_platform_instance_ptr, (float)scale_x, (float)scale_y);
+    }
+}
+
 JNIEXPORT void JNICALL
 Java_com_termux_x11_LorieView_sendKeyEvent(JNIEnv* env, jobject thiz, jint keycode, jint action) {
-      // 将输入流统一导向 global_platform，由其根据件前协议焦点的状态，分发给 X11 或 Wayland
     global_platform_inject_key((int32_t)keycode, (int32_t)action);
 }
 
-/**
- * @brief 当收并路由触控和鼠标指针事件
- */
 JNIEXPORT void JNICALL
 Java_com_termux_x11_LorieView_sendMouseEvent(JNIEnv* env, jobject thiz, jint x, jint y, jint action, jint button_mask) {
-      // 统一分发至抽象层
     global_platform_inject_pointer((int32_t)x, (int32_t)y, (int32_t)action, (int32_t)button_mask);
 }
