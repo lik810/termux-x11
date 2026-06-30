@@ -1,10 +1,10 @@
 /**
  * @file termux_hybrid_platform.cpp
- * @brief Termux-X11 & Wayland 统一输入分发与共享内存图像合并渲染引擎（动态符号解析修复版）
+ * @brief Termux-X11 & Wayland 统一底座（共享库构造器注入版）
  *
  * 核心升级：
- * 1. 使用 dlfcn 动态链接器在运行期加载原版 X11 的输入注入函数，彻底消除编译期链接错误。
- * 2. 导出标准的 extern "C" platform_set_output_scale 供 JNI 胶水层调用。
+ * 1. 使用 C/C++ 编译器 constructor 属性，在 libXlorie.so 被加载的第一时间强行拉起 Wayland 服务。
+ * 2. 绕过死机 main() 入口，同时向终端标准输出/错误流直接打印调试信息。
  */
 
 #include <stdint.h>
@@ -32,14 +32,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define DBG_PRINT(fmt, ...) { \
-    fprintf(stdout, "[Platform-DEBUG] " fmt "\n", ##__VA_ARGS__); \
+#define TERM_PRINT(fmt, ...) { \
+    fprintf(stdout, "[Platform-CONSTRUCTOR] " fmt "\n", ##__VA_ARGS__); \
     fflush(stdout); \
     LOGI(fmt, ##__VA_ARGS__); \
 }
 
-#define DBG_ERR(fmt, ...) { \
-    fprintf(stderr, "[Platform-ERROR] " fmt " (errno: %d, msg: %s)\n", ##__VA_ARGS__, errno, strerror(errno)); \
+#define TERM_ERR(fmt, ...) { \
+    fprintf(stderr, "[Platform-FATAL-ERROR] " fmt " (errno: %d, msg: %s)\n", ##__VA_ARGS__, errno, strerror(errno)); \
     fflush(stderr); \
     LOGE(fmt, ##__VA_ARGS__); \
 }
@@ -104,7 +104,7 @@ static jobject g_lorie_view_global_ref = NULL;
 static jmethodID g_set_clipboard_method = NULL;
 
 // ============================================================================
-// 2. 动态符号解析引擎：在运行时绑定原 X11 Server 的底层输入注入接口
+// 2. 动态符号解析引擎
 // ============================================================================
 
 typedef void (*LorieSendKeyFn)(int32_t, int32_t);
@@ -120,23 +120,15 @@ static void resolve_x11_symbols() {
     if (resolved) return;
 
     g_lorie_send_key = (LorieSendKeyFn)dlsym(RTLD_DEFAULT, "LorieSendKeyEvent");
-    if (!g_lorie_send_key) {
-        g_lorie_send_key = (LorieSendKeyFn)dlsym(RTLD_DEFAULT, "LorieKeyboardInput");
-    }
+    if (!g_lorie_send_key) g_lorie_send_key = (LorieSendKeyFn)dlsym(RTLD_DEFAULT, "LorieKeyboardInput");
 
     g_lorie_send_pointer = (LorieSendPointerFn)dlsym(RTLD_DEFAULT, "LorieSendPointerEvent");
-    if (!g_lorie_send_pointer) {
-        g_lorie_send_pointer = (LorieSendPointerFn)dlsym(RTLD_DEFAULT, "LoriePointerInput");
-    }
+    if (!g_lorie_send_pointer) g_lorie_send_pointer = (LorieSendPointerFn)dlsym(RTLD_DEFAULT, "LoriePointerInput");
 
     g_lorie_send_text = (LorieSendTextFn)dlsym(RTLD_DEFAULT, "LorieSendTextInput");
-    if (!g_lorie_send_text) {
-        g_lorie_send_text = (LorieSendTextFn)dlsym(RTLD_DEFAULT, "LorieTextInput");
-    }
+    if (!g_lorie_send_text) g_lorie_send_text = (LorieSendTextFn)dlsym(RTLD_DEFAULT, "LorieTextInput");
 
     resolved = true;
-    DBG_PRINT("Dynamic symbol resolved: key_injector=%p, pointer_injector=%p, text_injector=%p", 
-              g_lorie_send_key, g_lorie_send_pointer, g_lorie_send_text);
 }
 
 // ============================================================================
@@ -271,7 +263,7 @@ static void send_wayland_event(int client_fd, uint32_t object_id, uint16_t opcod
 static void* wayland_server_thread_func(void* arg);
 
 static void* wayland_server_thread_func(void* arg) {
-    DBG_PRINT("Wayland thread active and ready to accept connections.");
+    TERM_PRINT("Wayland engine background receiver thread is now active.");
     while (g_wl_server.is_running) {
         struct sockaddr_un client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -280,7 +272,7 @@ static void* wayland_server_thread_func(void* arg) {
             if (g_wl_server.is_running) usleep(100000);
             continue;
         }
-        DBG_PRINT("Wayland socket successfully accepted a new client!");
+        TERM_PRINT("Handshake: New Wayland Client successfully accepted!");
         g_wl_server.client_fd = client_fd;
         struct {
             uint32_t id;
@@ -315,7 +307,7 @@ static void* wayland_server_thread_func(void* arg) {
 }
 
 // ============================================================================
-// 5. C++ -> C 符号导出（解决编译期未定义链接错误的终极实现）
+// 5. C++ -> C 符号导出
 // ============================================================================
 
 #ifdef __cplusplus
@@ -324,39 +316,24 @@ extern "C" {
 
 void x11_on_key_event(int32_t keycode, platform_key_action_t action) {
     resolve_x11_symbols();
-    if (g_lorie_send_key) {
-        g_lorie_send_key(keycode, action == PLATFORM_KEY_DOWN ? 1 : 0);
-    } else {
-        DBG_ERR("x11_on_key_event failed: native key injector not resolved.");
-    }
+    if (g_lorie_send_key) g_lorie_send_key(keycode, action == PLATFORM_KEY_DOWN ? 1 : 0);
 }
 
 void x11_on_pointer_event(int32_t x, int32_t y, platform_pointer_action_t action, int32_t button_mask) {
     resolve_x11_symbols();
     if (g_lorie_send_pointer) {
-        int act = 0;
-        if (action == PLATFORM_POINTER_DOWN) act = 0;
-        else if (action == PLATFORM_POINTER_UP) act = 1;
-        else act = 2;
+        int act = (action == PLATFORM_POINTER_DOWN) ? 0 : ((action == PLATFORM_POINTER_UP) ? 1 : 2);
         g_lorie_send_pointer(x, y, act, button_mask);
-    } else {
-        DBG_ERR("x11_on_pointer_event failed: native pointer injector not resolved.");
     }
 }
 
 void x11_on_text_input(const char* utf8_text) {
     resolve_x11_symbols();
-    if (g_lorie_send_text) {
-        g_lorie_send_text(utf8_text);
-    } else {
-        DBG_ERR("x11_on_text_input failed: native text injector not resolved.");
-    }
+    if (g_lorie_send_text) g_lorie_send_text(utf8_text);
 }
 
 void platform_set_output_scale(void* self, float scale_x, float scale_y) {
-    if (self) {
-        android_impl_set_output_scale((android_platform_t*)self, scale_x, scale_y);
-    }
+    if (self) android_impl_set_output_scale((android_platform_t*)self, scale_x, scale_y);
 }
 
 void* init_android_platform(void* native_window) {
@@ -418,15 +395,15 @@ void global_platform_inject_text_input(const char* utf8_text) {
 
 bool start_wayland_compositor(const char* socket_dir) {
     if (g_wl_server.is_running) {
-        DBG_PRINT("Wayland compositor server is already running.");
+        TERM_PRINT("Wayland compositor server is already running.");
         return true;
     }
 
-    DBG_PRINT("Initializing Wayland UNIX socket inside path: %s", socket_dir);
+    TERM_PRINT("Initializing Wayland UNIX socket inside path: %s", socket_dir);
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        DBG_ERR("Failed to create UNIX socket descriptor.");
+        TERM_ERR("Failed to create UNIX socket descriptor.");
         return false;
     }
 
@@ -437,13 +414,13 @@ bool start_wayland_compositor(const char* socket_dir) {
     unlink(addr.sun_path); 
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        DBG_ERR("Failed to bind UNIX socket to path: %s", addr.sun_path);
+        TERM_ERR("Failed to bind UNIX socket to path: %s", addr.sun_path);
         close(fd);
         return false;
     }
 
     if (listen(fd, 5) < 0) {
-        DBG_ERR("Failed to put socket in listening state.");
+        TERM_ERR("Failed to put socket in listening state.");
         close(fd);
         return false;
     }
@@ -452,10 +429,10 @@ bool start_wayland_compositor(const char* socket_dir) {
     g_wl_server.is_running = true;
 
     setenv("WAYLAND_DISPLAY", "wayland-0", 1);
-    DBG_PRINT("Successfully listening on Wayland socket: %s", addr.sun_path);
+    TERM_PRINT("Successfully listening on Wayland socket: %s", addr.sun_path);
 
     if (pthread_create(&g_wl_server.thread, NULL, wayland_server_thread_func, NULL) != 0) {
-        DBG_ERR("Failed to create worker thread for socket handling.");
+        TERM_ERR("Failed to create worker thread for socket handling.");
         g_wl_server.is_running = false;
         close(fd);
         return false;
@@ -479,12 +456,7 @@ void global_platform_inject_key(int32_t keycode, int32_t action) {
 
 void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_t button_mask) {
     if (!g_platform) return;
-    platform_pointer_action_t plat_action;
-    switch(action) {
-        case 0: plat_action = PLATFORM_POINTER_DOWN; break;
-        case 1: plat_action = PLATFORM_POINTER_UP; break;
-        default: plat_action = PLATFORM_POINTER_MOVE; break;
-    }
+    platform_pointer_action_t plat_action = (action == 0) ? PLATFORM_POINTER_DOWN : ((action == 1) ? PLATFORM_POINTER_UP : PLATFORM_POINTER_MOVE);
     if (g_platform->current_focus == FOCUS_X11) {
         x11_on_pointer_event(x, y, plat_action, button_mask);
     } else if (g_platform->current_focus == FOCUS_WAYLAND) {
@@ -495,6 +467,33 @@ void global_platform_inject_pointer(int32_t x, int32_t y, int32_t action, int32_
             send_wayland_event(g_wl_server.client_fd, 4, 1, &motion_event, sizeof(motion_event));
         }
     }
+}
+
+// ============================================================================
+// 6. 核心重磅炸弹：共享库自触发构造器 (Constructor Injection)
+// ============================================================================
+
+__attribute__((constructor)) void lib_lorie_init(void) {
+    fprintf(stdout, "\n==================================================\n");
+    fprintf(stdout, "[Platform-DEBUG] libXlorie SO Constructor Triggered!\n");
+    fprintf(stdout, "==================================================\n");
+    fflush(stdout);
+
+    const char* socket_dir = getenv("TMPDIR");
+    if (!socket_dir) {
+        socket_dir = "/data/data/com.termux/files/usr/tmp";
+    }
+
+    fprintf(stdout, "[Platform-DEBUG] Target socket directory resolved: %s\n", socket_dir);
+    fflush(stdout);
+
+    if (start_wayland_compositor(socket_dir)) {
+        fprintf(stdout, "[Platform-DEBUG] Double-protocol Wayland Engine Initialized in Constructor!\n");
+    } else {
+        fprintf(stderr, "[Platform-ERROR] Failed to start Wayland engine in constructor!\n");
+    }
+    fflush(stdout);
+    fflush(stderr);
 }
 
 #ifdef __cplusplus
